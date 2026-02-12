@@ -206,19 +206,23 @@ static BOOL LooksLikeKnownImage(const BYTE* p, DWORD n) {
  * @param outPx    [out] Output dimensions in pixels / Выходные размеры в пикселях
  */
 static void HimetricToPixels(LONG hmWidth, LONG hmHeight, SIZE* outPx) {
+    if (!outPx) return;
+
     HDC hdc = GetDC(NULL);
-    
+
     // Get screen DPI (default to 96 if unavailable) / Получить DPI экрана (по умолчанию 96, если недоступно)
-    int dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
-    int dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
-    if (dpiX <= 0) dpiX = 96;
-    if (dpiY <= 0) dpiY = 96;
-    
+    int dpiX = 96, dpiY = 96;
+    if (hdc) {
+        dpiX = GetDeviceCaps(hdc, LOGPIXELSX);
+        dpiY = GetDeviceCaps(hdc, LOGPIXELSY);
+        if (dpiX <= 0) dpiX = 96;
+        if (dpiY <= 0) dpiY = 96;
+        ReleaseDC(NULL, hdc);
+    }
+
     // Convert HIMETRIC to pixels / Конвертировать HIMETRIC в пиксели
     outPx->cx = MulDiv(hmWidth,  dpiX, 2540);
     outPx->cy = MulDiv(hmHeight, dpiY, 2540);
-    
-    ReleaseDC(NULL, hdc);
 }
 
 /**
@@ -236,37 +240,68 @@ static void HimetricToPixels(LONG hmWidth, LONG hmHeight, SIZE* outPx) {
  */
 static HBITMAP DeepCopyHBITMAP(HBITMAP src) {
     if (!src) return NULL;
-    
+
     HDC hdc = GetDC(NULL);
+    if (!hdc) return NULL;
+
     BITMAP bm = {0};
-    
+
     // Get source bitmap info / Получить информацию об исходном bitmap'е
-    if (!GetObject(src, sizeof(bm), &bm) || bm.bmWidth<=0 || bm.bmHeight<=0) { 
-        ReleaseDC(NULL,hdc); 
-        return NULL; 
+    if (!GetObject(src, sizeof(bm), &bm) || bm.bmWidth <= 0 || bm.bmHeight <= 0) {
+        ReleaseDC(NULL, hdc);
+        return NULL;
     }
-    
+
     // Create destination bitmap / Создать целевой bitmap
     HBITMAP copy = CreateCompatibleBitmap(hdc, bm.bmWidth, bm.bmHeight);
-    if (!copy) { 
-        ReleaseDC(NULL, hdc); 
-        return NULL; 
+    if (!copy) {
+        ReleaseDC(NULL, hdc);
+        return NULL;
     }
-    
-    // Copy pixels using BitBlt / Копировать пиксели используя BitBlt
+
+    // Create DCs / Создать DC
     HDC sdc = CreateCompatibleDC(hdc);
     HDC ddc = CreateCompatibleDC(hdc);
-    HBITMAP oldS = (HBITMAP)SelectObject(sdc, src);
-    HBITMAP oldD = (HBITMAP)SelectObject(ddc, copy);
-    
-    BitBlt(ddc, 0, 0, bm.bmWidth, bm.bmHeight, sdc, 0, 0, SRCCOPY);
-    
+    if (!sdc || !ddc) {
+        if (sdc) DeleteDC(sdc);
+        if (ddc) DeleteDC(ddc);
+        DeleteObject(copy);
+        ReleaseDC(NULL, hdc);
+        return NULL;
+    }
+
+    // Select bitmaps / Выбрать bitmap'ы
+    HGDIOBJ oldS = SelectObject(sdc, src);
+    HGDIOBJ oldD = SelectObject(ddc, copy);
+    if (!oldS || oldS == HGDI_ERROR || !oldD || oldD == HGDI_ERROR) {
+        if (oldS && oldS != HGDI_ERROR) SelectObject(sdc, oldS);
+        if (oldD && oldD != HGDI_ERROR) SelectObject(ddc, oldD);
+        DeleteDC(sdc);
+        DeleteDC(ddc);
+        DeleteObject(copy);
+        ReleaseDC(NULL, hdc);
+        return NULL;
+    }
+
+    // Copy pixels / Копировать пиксели
+    if (!BitBlt(ddc, 0, 0, bm.bmWidth, bm.bmHeight, sdc, 0, 0, SRCCOPY)) {
+        // Restore and cleanup / Восстановить и очистить
+        SelectObject(sdc, oldS);
+        SelectObject(ddc, oldD);
+        DeleteDC(sdc);
+        DeleteDC(ddc);
+        DeleteObject(copy);
+        ReleaseDC(NULL, hdc);
+        return NULL;
+    }
+
+    // Restore and cleanup / Восстановить и очистить
     SelectObject(sdc, oldS);
     SelectObject(ddc, oldD);
     DeleteDC(sdc);
     DeleteDC(ddc);
     ReleaseDC(NULL, hdc);
-    
+
     return copy;
 }
 

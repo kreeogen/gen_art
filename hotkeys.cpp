@@ -153,7 +153,13 @@ void Hotkeys_Init(HWND hWinamp, int cmdId)
     // This affects ONLY the Winamp thread, not the entire system
     // NULL hMod означает модуль этой DLL
     // Это влияет ТОЛЬКО на поток Winamp, не на всю систему
-    g_hHook = SetWindowsHookEx(WH_KEYBOARD, KeyboardProc, NULL, GetCurrentThreadId());
+    DWORD tid = 0;
+    if (g_hWinamp && IsWindow(g_hWinamp)) {
+        tid = GetWindowThreadProcessId(g_hWinamp, NULL);
+    }
+    if (!tid) tid = GetCurrentThreadId();
+
+    g_hHook = SetWindowsHookEx(WH_KEYBOARD, KeyboardProc, NULL, tid);
 }
 
 /**

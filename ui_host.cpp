@@ -26,6 +26,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <ole2.h>
 #include <tchar.h>
 
 // ============================================================================
@@ -166,6 +167,8 @@ typedef struct {
     int isOpen;         ///< TRUE if window is currently open / TRUE если окно открыто
     int isQuitting;     ///< TRUE during shutdown / TRUE при завершении работы
     int isInitialized;  ///< TRUE if fully initialized / TRUE если полностью инициализировано
+    int oleInited;      ///< TRUE if OleInitialize was called by us / TRUE если OleInitialize вызван нами
+    int refreshPosted; ///< TRUE if WM_APT_REFRESH already posted / TRUE если WM_APT_REFRESH уже запощен
     
     // === Window Position / Позиция окна ===
     struct {
@@ -465,7 +468,6 @@ static LRESULT HandleSkinChanges(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     coverView = CoverView_FindOn(g_state.dlg);
     if (coverView) {
         InvalidateRect(coverView, NULL, TRUE);
-        UpdateWindow(coverView);
     }
     
     // Forward to original window procedure / Переслать оригинальной оконной процедуре
@@ -487,6 +489,21 @@ static LRESULT HandleSkinChanges(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
  * When detected, posts WM_APT_REFRESH to reload album art.
  * При обнаружении отправляет WM_APT_REFRESH для перезагрузки обложки.
  */
+static void RequestCoverRefreshAsync(void)
+{
+    // Do NOT refresh from inside Winamp's WndProc stack.
+    // Не обновляемся прямо из стека оконной процедуры Winamp - избегаем реэнтранси.
+    //
+    // Also coalesce refresh storms: we only keep ONE pending WM_APT_REFRESH in the queue.
+    // Также "схлопываем" штормы обновлений: держим только ОДНО ожидающее WM_APT_REFRESH в очереди.
+    if (g_state.dlg && IsWindow(g_state.dlg)) {
+        if (InterlockedExchange((LONG*)&g_state.refreshPosted, 1) == 0) {
+            PostMessage(g_state.dlg, WM_APT_REFRESH, 0, 0);
+        }
+    }
+}
+
+
 static LRESULT HandleIPCMessages(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     // Check if this is a playing/playlist change event
@@ -494,7 +511,7 @@ static LRESULT HandleIPCMessages(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (lp == IPC_PLAYING_FILE || lp == IPC_PLAYLIST_MODIFIED) {
         // Post refresh message to update album art
         // Отправить сообщение обновления для обновления обложки
-        PostMessage(hwnd, WM_APT_REFRESH, 0, 0);
+        RequestCoverRefreshAsync();
     }
     
     return CallWindowProcA(g_state.oldProc, hwnd, msg, wp, lp);
@@ -665,6 +682,11 @@ static LRESULT CALLBACK WinampWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             SetWindowLongA(hwnd, GWL_WNDPROC, (LONG)g_state.oldProc);
             g_state.oldProc = NULL;
         }
+        // Extremely defensive: should never happen, but avoids CallWindowProc(NULL) crash
+        // Супер-защита: по идее не случится, но предотвращает краш CallWindowProc(NULL)
+        if (!old) {
+            return DefWindowProcA(hwnd, msg, wp, lp);
+        }
         return CallWindowProcA(old, hwnd, msg, wp, lp);
     }
 
@@ -684,7 +706,7 @@ static LRESULT CALLBACK WinampWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     // Custom refresh message / Пользовательское сообщение обновления
     if (msg == WM_APT_REFRESH) {
-        CoverView_ReloadFromCurrent();
+        RequestCoverRefreshAsync();
         return 0;
     }
 
@@ -761,6 +783,14 @@ static LRESULT CALLBACK DlgProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // Update menu checkmark / Обновить галочку меню
         UpdateMenuCheckmark(1);
         
+        return 0;
+
+    case WM_APT_REFRESH:
+        // Refresh cover art asynchronously (posted from Winamp events)
+        // Обновить обложку асинхронно (постится из событий Winamp)
+        // Allow next refresh to be posted / Разрешить пост следующего обновления
+        g_state.refreshPosted = 0;
+        CoverView_ReloadFromCurrent();
         return 0;
 
     case WM_CTLCOLORDLG:
@@ -885,6 +915,18 @@ int UIHost_Init(void)
     // ШАГ 2: Получить окно и версию Winamp
     // ========================================================================
     g_state.winampWnd = UIHost_GetWinampWnd();
+
+    // Initialize OLE/COM once (required for OleLoadPicture in image_loader)
+    // Инициализировать OLE/COM один раз (нужно для OleLoadPicture в image_loader)
+    if (!g_state.oleInited) {
+        HRESULT hrOle = OleInitialize(NULL);
+        // S_OK: initialized now, S_FALSE: already initialized for this thread (still needs OleUninitialize)
+        if (hrOle == S_OK || hrOle == S_FALSE) {
+            g_state.oleInited = 1;
+        }
+        // RPC_E_CHANGED_MODE means COM is already initialized in a different mode.
+        // In that case we must NOT call OleUninitialize(), and OleLoadPicture should still work.
+    }
     g_state.waVersion = (int)SendMessage(g_state.winampWnd, WM_WA_IPC, 
                                          0, IPC_GETVERSION);
 
@@ -1124,7 +1166,9 @@ void UIHost_Quit(void)
     // STEP 6: Remove menu item
     // ШАГ 6: Удалить пункт меню
     // ========================================================================
-    RemoveMenuItemFromWinamp();
+    if (g_state.menuReady && g_state.winampWnd && IsWindow(g_state.winampWnd)) {
+        RemoveMenuItemFromWinamp();
+    }
     g_state.menuReady = 0;
 
     // ========================================================================
@@ -1134,7 +1178,25 @@ void UIHost_Quit(void)
     Skin_DeleteDialogBrush();
     Img_Cleanup();  // CRITICAL: Prevents GDI+ process hang / КРИТИЧНО: Предотвращает зависание процесса GDI+
     
-    // ========================================================================
+        // Unregister our cover view class (safety against stale classes)
+    // Снять регистрацию класса просмотрщика (защита от "мертвых" классов)
+    {
+        HINSTANCE hi = UIHost_GetHInstance();
+        if (hi) {
+            UnregisterClassA("APT_CoverArtView", hi);
+        }
+        // Backward safety: in case an older build registered on Winamp.exe
+        UnregisterClassA("APT_CoverArtView", GetModuleHandleA(NULL));
+    }
+
+    // Uninitialize OLE/COM if we initialized it
+    // Деинициализировать OLE/COM если мы его инициализировали
+    if (g_state.oleInited) {
+        OleUninitialize();
+        g_state.oleInited = 0;
+    }
+
+// ========================================================================
     // STEP 8: Reset initialization state
     // ШАГ 8: Сбросить состояние инициализации
     // ========================================================================
